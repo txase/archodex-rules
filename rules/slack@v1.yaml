@@ -1,0 +1,38 @@
+Name: Slack
+Default: true
+Description: >-
+  This rule captures API keys used when making requests to the Slack API. The API keys are treated as Secret Values,
+  meaning they are cryptographically hashed into a unique identifier before being logged or reported to the Archodex
+  service.
+
+Rules:
+  - Hostnames:
+      - slack.com
+    TransportRules:
+      - Http:
+          Request:
+            Headers:
+              Authorization:
+                # Match the Bearer scheme for Slack token prefixes except temporary tokens (xoxe-*):
+                Regex: ^Bearer\s+(?:xoxb|xoxp|xapp)-\S+$
+          ResourceCaptures:
+            - Type: Slack API
+              Id: '{TlsServerName}'
+            - Type: Secret Value
+              Id:
+                "{Request.Headers.authorization | parse_http_auth | render('{ Value.Bearer.Token }') |
+                secret_value_hash}"
+          EventCaptures:
+            - Principals:
+                - Event: Used
+                  Resource:
+                    - Type: Secret Value
+                      Id:
+                        "{Request.Headers.authorization | parse_http_auth | render('{ Value.Bearer.Token }') |
+                        secret_value_hash}"
+              Events:
+                - Types:
+                    - Accessed
+                  Resources:
+                    - - Type: Slack API
+                        Id: '{TlsServerName}'
