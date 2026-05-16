@@ -1,0 +1,205 @@
+Name: GitHub Copilot
+Default: true
+Mode: ai
+Description: >-
+  Monitors GitHub Copilot provider traffic. Captures OAuth tokens (hashed), model/session metadata, usage metrics, tool
+  calls, and streaming events for Copilot CLI and related clients.
+
+Rules:
+  - Hostnames:
+      - api.githubcopilot.com
+      - api.individual.githubcopilot.com
+      - api.enterprise.githubcopilot.com
+    TransportRules:
+      - Http:
+          Request:
+            Methods:
+              - POST
+            Routes:
+              - /chat/completions
+              - /v1/chat/completions
+              - /v1/messages
+            Headers:
+              Authorization:
+                Regex: ^(?i:Bearer)\s+\S+$
+            Body:
+              Model:
+                Path: $.model
+                Required: false
+              Prompt:
+                Path: $.messages
+                Required: false
+              System:
+                Path: $.system
+                Required: false
+              Tools:
+                Path: $.tools
+                Required: false
+          Response:
+            Mode: auto
+            RequireHeaders: false
+            Headers:
+              request-id: {}
+              x-github-request-id: {}
+              x-request-id: {}
+            Discrete:
+              Body:
+                ResponseId:
+                  Path: $.id
+                  Required: false
+                Model:
+                  Path: $.model
+                  Required: false
+                AssistantResponse:
+                  Path: $.choices[*].message.content
+                  Required: false
+                InputTokens:
+                  Path: $.usage.input_tokens
+                  Required: false
+                PromptTokens:
+                  Path: $.usage.prompt_tokens
+                  Required: false
+                OutputTokens:
+                  Path: $.usage.output_tokens
+                  Required: false
+                CompletionTokens:
+                  Path: $.usage.completion_tokens
+                  Required: false
+            Streaming:
+              Anchors:
+                # Copilot CLI can use the Anthropic Messages-compatible stream.
+                - Name: message_delta
+                  Match:
+                    EventType: message_delta
+                  Captures:
+                    InputTokens: $.usage.input_tokens
+                    OutputTokens: $.usage.output_tokens
+                    StopReason: $.delta.stop_reason
+              CarryForward:
+                Window: since_previous_anchor
+                Sources:
+                  - Name: message_start
+                    Match:
+                      EventType: message_start
+                    MergeIntoCaptures:
+                      ResponseId: $.message.id
+                      Model: $.message.model
+                  # Copilot can also use OpenAI Chat Completions-compatible streaming.
+                  - Name: chat_completion_chunk
+                    Match:
+                      EventType: chat.completion.chunk
+                    MergeIntoCaptures:
+                      ResponseId: $.id
+                      Model: $.model
+                    EmitAsSpanEvent:
+                      Name: archodex.stream.chat_completion_chunk
+                      Attributes:
+                        choice_index: $.choices[0].index
+                        finish_reason: $.choices[0].finish_reason
+                        delta_text: $.choices[0].delta.content
+                        tool_calls: $.choices[0].delta.tool_calls
+              Blocks:
+                - StartMatch:
+                    EventType: content_block_start
+                    Where:
+                      - Path: $.content_block.type
+                        Equals: tool_use
+                  DeltaEventType: content_block_delta
+                  StopEventType: content_block_stop
+                  BlockIndexPath: $.index
+                  DeltaPath: $.delta.partial_json
+                  EmitAtStop:
+                    Name: archodex.stream.tool_use
+                    ContentAttribute: tool_input
+                    Attributes:
+                      tool_id: $.content_block.id
+                      tool_name: $.content_block.name
+                - StartMatch:
+                    EventType: content_block_start
+                    Where:
+                      - Path: $.content_block.type
+                        Equals: text
+                  DeltaEventType: content_block_delta
+                  StopEventType: content_block_stop
+                  BlockIndexPath: $.index
+                  DeltaPath: $.delta.text
+                  EmitAtStop:
+                    Name: archodex.stream.text
+                    ContentAttribute: output_text
+                    BodyCaptureKey: OutputText
+                    Attributes: {}
+              Emit:
+                CarryForwardAsSpanEvents: true
+                TimelineAsSpanEvents: false
+              Limits:
+                MaxEvents: 5000
+                MaxCarryForwardPerAnchor: null
+                MaxCarryForwardEventBytes: null
+                OverflowPolicy: discard
+          ResourceCaptures:
+            - Type: GitHub Copilot API
+              Id: '{TlsServerName}'
+              Contains:
+                - Type: Model
+                  Id:
+                    "{Request.BodyCaptures.Model | first | default(Response.BodyCaptures.Model | last |
+                    default('unknown'))}"
+            - Type: Secret Value
+              Id: "{Request.Headers['authorization'] | strip_prefix('Bearer ') | secret_value_hash}"
+          EventCaptures:
+            - TraceContext:
+                TraceIdSeed:
+                  "{Request.Headers['x-client-session-id'] | first | default(Request.Headers['x-copilot-session-id'] |
+                  first | default(Request.Headers['copilot-session-id'] | first |
+                  default(Request.Headers['x-session-id'] | first)))}"
+              Principals:
+                - Event: Used
+                  Resource:
+                    - Type: Secret Value
+                      Id: "{Request.Headers['authorization'] | strip_prefix('Bearer ') | secret_value_hash}"
+              Events:
+                - Types:
+                    - Accessed
+                  Resources:
+                    - - Type: GitHub Copilot API
+                        Id: '{TlsServerName}'
+                      - Type: Model
+                        Id:
+                          "{Request.BodyCaptures.Model | first | default(Response.BodyCaptures.Model | last |
+                          default('unknown'))}"
+              Attributes:
+                gen_ai.request.model:
+                  "{Request.BodyCaptures.Model | first | default(Response.BodyCaptures.Model | last |
+                  default('unknown'))}"
+                gen_ai.usage.input_tokens:
+                  Value:
+                    '{Response.BodyCaptures.InputTokens | last | default(Response.BodyCaptures.PromptTokens | last)}'
+                  Type: Number
+                gen_ai.usage.output_tokens:
+                  Value:
+                    '{Response.BodyCaptures.OutputTokens | last | default(Response.BodyCaptures.CompletionTokens |
+                    last)}'
+                  Type: Number
+                gen_ai.response.id: '{Response.BodyCaptures.ResponseId | last}'
+                gen_ai.conversation.id:
+                  "{Request.Headers['x-client-session-id'] | first | default(Request.Headers['x-copilot-session-id'] |
+                  first | default(Request.Headers['copilot-session-id'] | first |
+                  default(Request.Headers['x-session-id'] | first)))}"
+                archodex.github_copilot.session_id:
+                  "{Request.Headers['x-client-session-id'] | first | default(Request.Headers['x-copilot-session-id'] |
+                  first | default(Request.Headers['copilot-session-id'] | first |
+                  default(Request.Headers['x-session-id'] | first)))}"
+                archodex.github_copilot.request_id:
+                  "{Response.Headers['request-id'] | first | default(Response.Headers['x-github-request-id'] | first |
+                  default(Response.Headers['x-request-id'] | first))}"
+                archodex.github_copilot.stop_reason: '{Response.BodyCaptures.StopReason | last}'
+                gen_ai.operation.name: chat
+                gen_ai.provider.name: github_copilot
+                gen_ai.capability.name: GitHub Copilot
+              SpanEvents:
+                gen_ai.client.inference.operation.details:
+                  gen_ai.system_instructions: '{Request.BodyCaptures.System | tojson}'
+                  gen_ai.input.messages: '{Request.BodyCaptures.Prompt | tojson}'
+                  gen_ai.output.messages:
+                    "{Response.BodyCaptures.OutputText | join('') | default(Response.BodyCaptures.AssistantResponse |
+                    join(''))}"
